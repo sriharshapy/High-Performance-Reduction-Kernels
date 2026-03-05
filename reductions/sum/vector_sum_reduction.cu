@@ -9,26 +9,6 @@
  *   - NVIDIA "Faster Parallel Reductions on Kepler" / warp-level primitives
  *     https://developer.nvidia.com/blog/using-cuda-warp-level-primitives/
  *
- * Accumulation loop unrolling (REDUCE_UNROLL):
- *   A single-accumulator loop creates a serial dependency chain: each iteration
- *   must wait for the previous `sum +=` to complete before the address for the
- *   next load can be resolved.  The GPU's memory subsystem can service many
- *   in-flight loads simultaneously, but a single accumulator never keeps more
- *   than one outstanding, leaving the ~200-cycle DRAM latency fully exposed.
- *   Using REDUCE_UNROLL independent accumulators breaks the chain: all
- *   REDUCE_UNROLL loads are issued before any result is needed, keeping the
- *   load pipeline full.  The partial sums are folded into one scalar after the
- *   loop.  This mirrors what CUB does internally with 4–8 accumulators.
- *
- * Dynamic access-pattern selection (CONTIGUOUS template parameter):
- *   Contiguous block assignment creates long sequential streams that the GPU
- *   hardware prefetcher can exploit, keeping cache lines arriving well beyond
- *   the physical L2 boundary.  Empirically on sm_75 (T4, 4 MB L2) the
- *   contiguous pattern wins up to ~100 M floats (400 MB = 100 × L2); beyond
- *   that the grid-stride pattern wins by maximising DRAM channel parallelism.
- *   The threshold is set to 100 × cudaDevAttrL2CacheSize so it scales
- *   automatically with the device (T4 → 400 MB, A100 → 4 GB, H100 → 5 GB).
- *
  * Compile: nvcc -O3 -arch=sm_80 -o vector_sum_reduction vector_sum_reduction.cu
  * Run:     ./vector_sum_reduction [input_file] [n]
  *          input_file : raw binary float32 (default: out.bin)
@@ -42,13 +22,14 @@
 #include <cstring>
 #include <cuda_runtime.h>
 
-#define WARP_SIZE    32
-#define FULL_MASK    0xffffffffu
-// Number of independent accumulators in the vectorized load loop.
-// Each accumulator has no data dependency on the others, so the compiler
-// can issue all REDUCE_UNROLL loads before any result arrives, saturating
-// the memory pipeline and hiding DRAM latency.
-#define REDUCE_UNROLL 4
+#define WARP_SIZE 32
+#define FULL_MASK 0xffffffffu
+
+// At this element count (~800 MB) the kernel becomes fully DRAM-bandwidth-bound.
+// Above the threshold, the single-accumulator dependency chain limits ILP and
+// prevents the hardware from issuing enough independent DRAM requests to saturate
+// all memory controllers. The ILP4 kernel below breaks that chain.
+#define N_ILP4_THRESHOLD 200000000UL
 
 // -----------------------------------------------------------------------------
 // Warp-level sum reduction using shuffle (no shared memory; avoids bank conflicts).
@@ -83,18 +64,12 @@ __device__ float block_reduce_sum(float val) {
 }
 
 // -----------------------------------------------------------------------------
-// Kernel: REDUCE_UNROLL independent accumulators hide DRAM latency (see header).
-//
-// Template parameter CONTIGUOUS selects the access pattern:
-//   true  — each block owns a contiguous segment of float4 chunks; improves
-//            L1/L2 reuse when the whole dataset fits (or partially fits) in cache.
-//   false — global grid-stride loop; all blocks issue requests to interleaved
-//            DRAM channels simultaneously when data >> L2 (no locality benefit).
-//
-// The host selects the pattern at launch time based on n vs L2 cache size
-// (see use_contiguous_blocks()), so no runtime branch lives in the hot loop.
+// Kernel: accumulation over contiguous segments per block, then block reduce.
+// Uses float4 loads for better memory throughput; scalar tail for remainder.
+// Each block is assigned a contiguous range of float4-sized chunks, improving
+// L1/L2 locality compared to a single global strided pattern.
+// Everything is accumulated in float.
 // -----------------------------------------------------------------------------
-template <bool CONTIGUOUS>
 __global__ void reduce_sum_kernel_float_in(const float* __restrict__ inputs,
                                            size_t n,
                                            float* __restrict__ partial_sums) {
@@ -103,70 +78,91 @@ __global__ void reduce_sum_kernel_float_in(const float* __restrict__ inputs,
   const int  tid               = threadIdx.x;
   const int  bid               = blockIdx.x;
 
-  const size_t vec_n4        = n / 4;
-  const size_t stride        = (size_t)threads_per_block;
-  const size_t total_threads = stride * (size_t)num_blocks;
-  const size_t global_tid    = (size_t)bid * stride + (size_t)tid;
+  // Number of float4-sized chunks in the input
+  const size_t vec_n4 = n / 4;  // each chunk is 4 floats
+
+  // Assign a contiguous range of float4 chunks to each block
+  const size_t float4_per_block = (vec_n4 + (size_t)num_blocks - 1) / (size_t)num_blocks;
+  const size_t start4 = (size_t)bid * float4_per_block;
+  size_t       end4   = start4 + float4_per_block;
+  if (end4 > vec_n4) end4 = vec_n4;
+
+  float sum = 0.0f;
+
+  const float4* inputs4 = reinterpret_cast<const float4*>(inputs);
+  // Vectorized path: this block walks its own contiguous segment,
+  // threads iterate over that segment with a block-local stride.
+  for (size_t idx4 = start4 + (size_t)tid; idx4 < end4; idx4 += (size_t)threads_per_block) {
+    const float4 v = inputs4[idx4];
+    sum += v.x + v.y + v.z + v.w;
+  }
+
+  // Scalar tail for remaining elements (n % 4).
+  const size_t tail_start    = vec_n4 * 4;
+  const size_t total_threads = (size_t)threads_per_block * (size_t)num_blocks;
+  const size_t global_tid    = (size_t)bid * (size_t)threads_per_block + (size_t)tid;
+  for (size_t i = tail_start + global_tid; i < n; i += total_threads)
+    sum += inputs[i];
+
+  sum = block_reduce_sum(sum);
+  if (threadIdx.x == 0) partial_sums[blockIdx.x] = sum;
+}
+
+// -----------------------------------------------------------------------------
+// ILP4 kernel: same contiguous-block assignment as the kernel above, but uses
+// four independent accumulators fed by four independent __ldg float4 loads per
+// loop iteration. The compiler can issue all four loads before any add resolves,
+// keeping the DRAM controllers saturated on bandwidth-bound problems (n ≥ 200M).
+//
+// Used only when n >= N_ILP4_THRESHOLD; below that threshold the shorter startup
+// path of reduce_sum_kernel_float_in wins because the array fits in L2/L3 and
+// ILP provides no additional benefit.
+// -----------------------------------------------------------------------------
+__global__ void reduce_sum_kernel_float_in_ilp4(const float* __restrict__ inputs,
+                                                size_t n,
+                                                float* __restrict__ partial_sums) {
+  const int    threads_per_block = blockDim.x;
+  const int    num_blocks        = gridDim.x;
+  const int    tid               = threadIdx.x;
+  const int    bid               = blockIdx.x;
+  const size_t stride            = (size_t)threads_per_block;
+
+  const size_t vec_n4           = n / 4;
+  const size_t float4_per_block = (vec_n4 + (size_t)num_blocks - 1) / (size_t)num_blocks;
+  const size_t start4           = (size_t)bid * float4_per_block;
+  size_t       end4             = start4 + float4_per_block;
+  if (end4 > vec_n4) end4 = vec_n4;
 
   const float4* inputs4 = reinterpret_cast<const float4*>(inputs);
 
-  // Four independent accumulators — no cross-accumulator data dependencies.
   float sum0 = 0.f, sum1 = 0.f, sum2 = 0.f, sum3 = 0.f;
+  size_t idx4 = start4 + (size_t)tid;
 
-  if constexpr (CONTIGUOUS) {
-    // Each block covers a contiguous segment; threads stride within it.
-    // Good when data fits (or partially fits) in L2: subsequent iterations
-    // hit cache-warm lines before they are evicted.
-    const size_t float4_per_block = (vec_n4 + (size_t)num_blocks - 1) / (size_t)num_blocks;
-    const size_t start4 = (size_t)bid * float4_per_block;
-    size_t       end4   = start4 + float4_per_block;
-    if (end4 > vec_n4) end4 = vec_n4;
-
-    size_t idx4 = start4 + (size_t)tid;
-    for (; idx4 + (REDUCE_UNROLL - 1) * stride < end4; idx4 += REDUCE_UNROLL * stride) {
-      const float4 v0 = inputs4[idx4];
-      const float4 v1 = inputs4[idx4 +     stride];
-      const float4 v2 = inputs4[idx4 + 2 * stride];
-      const float4 v3 = inputs4[idx4 + 3 * stride];
-      sum0 += v0.x + v0.y + v0.z + v0.w;
-      sum1 += v1.x + v1.y + v1.z + v1.w;
-      sum2 += v2.x + v2.y + v2.z + v2.w;
-      sum3 += v3.x + v3.y + v3.z + v3.w;
-    }
-#pragma unroll 1
-    for (; idx4 < end4; idx4 += stride) {
-      const float4 v = inputs4[idx4];
-      sum0 += v.x + v.y + v.z + v.w;
-    }
-  } else {
-    // Global grid-stride loop: adjacent threads in a warp access adjacent
-    // float4 chunks (coalesced), and all blocks interleave across the full
-    // address space, hitting every DRAM channel simultaneously.
-    // Preferred when data >> L2 (no locality to exploit).
-    size_t idx4 = global_tid;
-    for (; idx4 + (REDUCE_UNROLL - 1) * total_threads < vec_n4;
-           idx4 += REDUCE_UNROLL * total_threads) {
-      const float4 v0 = inputs4[idx4];
-      const float4 v1 = inputs4[idx4 +     total_threads];
-      const float4 v2 = inputs4[idx4 + 2 * total_threads];
-      const float4 v3 = inputs4[idx4 + 3 * total_threads];
-      sum0 += v0.x + v0.y + v0.z + v0.w;
-      sum1 += v1.x + v1.y + v1.z + v1.w;
-      sum2 += v2.x + v2.y + v2.z + v2.w;
-      sum3 += v3.x + v3.y + v3.z + v3.w;
-    }
-#pragma unroll 1
-    for (; idx4 < vec_n4; idx4 += total_threads) {
-      const float4 v = inputs4[idx4];
-      sum0 += v.x + v.y + v.z + v.w;
-    }
+  // Four independent __ldg loads per iteration; the compiler issues all four
+  // before any add resolves, breaking the serial dependency chain and allowing
+  // the hardware prefetcher to keep DRAM fully pipelined.
+  for (; idx4 + 3 * stride < end4; idx4 += 4 * stride) {
+    float4 v0 = __ldg(&inputs4[idx4]);
+    float4 v1 = __ldg(&inputs4[idx4 + stride]);
+    float4 v2 = __ldg(&inputs4[idx4 + 2 * stride]);
+    float4 v3 = __ldg(&inputs4[idx4 + 3 * stride]);
+    sum0 += v0.x + v0.y + v0.z + v0.w;
+    sum1 += v1.x + v1.y + v1.z + v1.w;
+    sum2 += v2.x + v2.y + v2.z + v2.w;
+    sum3 += v3.x + v3.y + v3.z + v3.w;
+  }
+  // Remainder: fewer than 4 strides left in this block's segment.
+  for (; idx4 < end4; idx4 += stride) {
+    float4 v = __ldg(&inputs4[idx4]);
+    sum0 += v.x + v.y + v.z + v.w;
   }
 
-  // Fold the four independent partial sums.
-  float sum = (sum0 + sum1) + (sum2 + sum3);
+  float sum = sum0 + sum1 + sum2 + sum3;
 
-  // Scalar tail for remaining elements (n % 4).
-  const size_t tail_start = vec_n4 * 4;
+  // Scalar tail for elements that don't fill a float4 (n % 4).
+  const size_t tail_start    = vec_n4 * 4;
+  const size_t total_threads = (size_t)threads_per_block * (size_t)num_blocks;
+  const size_t global_tid    = (size_t)bid * (size_t)threads_per_block + (size_t)tid;
   for (size_t i = tail_start + global_tid; i < n; i += total_threads)
     sum += inputs[i];
 
@@ -190,56 +186,15 @@ __global__ void reduce_sum_kernel_float_in_pass2(const float* __restrict__ input
 }
 
 // -----------------------------------------------------------------------------
-// Return true when contiguous block assignment is expected to be faster.
-//
-// Why the threshold is 100 × L2, not 1 × L2:
-//   The GPU hardware prefetcher recognises long sequential streams and issues
-//   speculative loads ahead of the program counter.  Contiguous block
-//   assignment creates exactly those streams (each block walks a single
-//   contiguous region), so the prefetcher can keep cache lines arriving even
-//   when the working set far exceeds physical L2.  Benchmarks on sm_75 (T4,
-//   4 MB L2) show contiguous wins up to ~100 M floats (400 MB = 100 × L2):
-//
-//     n            fastest       ms
-//     10 000       CUDA C        0.0090
-//     100 000      CUDA C        0.0107
-//     500 000      CUDA C CUB    0.0138   ← CUB barely edges ahead here
-//     1 000 000    CUDA C        0.0134
-//     10 000 000   CUDA C CUB    0.1596   ← very close
-//     50 000 000   CUDA C        0.7514
-//     100 000 000  CUDA C        1.4834   ← last win for contiguous
-//     500 000 000  PyTorch       7.2716   ← grid-stride takes over
-//
-//   Once data >> 100 × L2 the prefetcher provides no further benefit and the
-//   grid-stride pattern wins because all blocks interleave DRAM channel
-//   requests simultaneously instead of serialising over their own segment.
-//
-// Scaling by 100 × L2 keeps the threshold proportional across generations:
-//   T4   (sm_75, 4 MB L2)  →  400 MB  =  100 M floats
-//   A100 (sm_80, 40 MB L2) →  4 GB    =    1 B floats
-//   H100 (sm_90, 50 MB L2) →  5 GB    =  1.25 B floats
-//
-// Fallback when L2 size cannot be queried: use the empirical 400 MB value.
-// -----------------------------------------------------------------------------
-static bool use_contiguous_blocks(size_t n) {
-  int l2_bytes = 0;
-  cudaDeviceGetAttribute(&l2_bytes, cudaDevAttrL2CacheSize, 0);
-  const size_t threshold = (l2_bytes > 0)
-      ? (size_t)l2_bytes * 100          // device-proportional: 100 × L2
-      : (size_t)400 * 1024 * 1024;      // fallback: 400 MB (empirical T4 value)
-  return n * sizeof(float) <= threshold;
-}
-
-// -----------------------------------------------------------------------------
 // Host: run two-pass reduction in float, return result.
 // Second pass uses one block with one thread per partial (coalesced) to cut DRAM.
 // -----------------------------------------------------------------------------
 static float reduce_sum(const float* d_inputs, size_t n, int blocks, int threads_per_block,
-                        float* d_partial, bool contiguous) {
-  if (contiguous)
-    reduce_sum_kernel_float_in<true><<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
+                        float* d_partial) {
+  if (n >= N_ILP4_THRESHOLD)
+    reduce_sum_kernel_float_in_ilp4<<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
   else
-    reduce_sum_kernel_float_in<false><<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
+    reduce_sum_kernel_float_in<<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
 
   // One thread per partial, round up to warp size; cap at 1024
   int pass2_threads = (int)((blocks + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);
@@ -327,9 +282,6 @@ int main(int argc, char** argv) {
   int blocks = 0, max_blocks = 0;
   get_reduction_launch_config(n, threads, &blocks, &max_blocks);
 
-  // Decide access pattern once, before any kernel launch.
-  const bool contiguous = use_contiguous_blocks(n);
-
   float* d_input   = nullptr;
   float* d_partial = nullptr;
   cudaMalloc(&d_input, n * sizeof(float));
@@ -340,7 +292,7 @@ int main(int argc, char** argv) {
   if (do_warmup) {
     const int warmup_iters = 3;
     for (int w = 0; w < warmup_iters; w++)
-      (void)reduce_sum(d_input, n, blocks, threads, d_partial, contiguous);
+      (void)reduce_sum(d_input, n, blocks, threads, d_partial);
   }
 
   int pass2_threads = (int)((blocks + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);
@@ -353,10 +305,10 @@ int main(int argc, char** argv) {
   float total_ms = 0.f;
   for (int t = 0; t < timed_iters; t++) {
     cudaEventRecord(ev_start);
-    if (contiguous)
-      reduce_sum_kernel_float_in<true><<<blocks, threads>>>(d_input, n, d_partial);
+    if (n >= N_ILP4_THRESHOLD)
+      reduce_sum_kernel_float_in_ilp4<<<blocks, threads>>>(d_input, n, d_partial);
     else
-      reduce_sum_kernel_float_in<false><<<blocks, threads>>>(d_input, n, d_partial);
+      reduce_sum_kernel_float_in<<<blocks, threads>>>(d_input, n, d_partial);
     reduce_sum_kernel_float_in_pass2<<<1, pass2_threads>>>(d_partial, (size_t)blocks, d_partial);
     cudaEventRecord(ev_stop);
     cudaEventSynchronize(ev_stop);
@@ -377,7 +329,6 @@ int main(int argc, char** argv) {
   printf("blocks = %d\n", blocks);
   printf("threads = %d\n", threads);
   printf("SMs = %d\n", num_sms);
-  printf("access_pattern = %s\n", contiguous ? "contiguous" : "grid-stride");
   printf("sum = %.10g\n", (double)sum);
   printf("avg_kernel_ms = %.4f\n", avg_ms);
   printf("niterations = %d\n", timed_iters);
