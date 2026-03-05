@@ -102,6 +102,72 @@ At 500M–1B elements all kernels become fully **DRAM bandwidth-bound** — the 
 
 ---
 
+## Optimization: ILP4 accumulator for large arrays (`n ≥ 200M`)
+
+### Root cause
+
+At `n ≥ 200M` the input array (~800 MB+) completely overwhelms the GPU's L2 cache (40 MB on a T4). Every load goes all the way to DRAM. In that regime the original kernel hits a hidden bottleneck:
+
+```cuda
+// Original — single accumulator creates a serial dependency chain
+for (size_t idx4 = start4 + tid; idx4 < end4; idx4 += threads_per_block) {
+    const float4 v = inputs4[idx4];
+    sum += v.x + v.y + v.z + v.w;   // next iteration blocked until this add finishes
+}
+```
+
+Each iteration's address is independent of `sum`, but the `sum +=` creates a **serial data-dependency chain**. The GPU cannot issue the next load until the previous add writes back to `sum`. With DRAM latency in the hundreds of nanoseconds, most threads sit stalled — DRAM controllers are under-utilised and bandwidth is wasted.
+
+### Fix: `reduce_sum_kernel_float_in_ilp4`
+
+A second kernel is compiled alongside the original. It uses **four independent accumulator registers** and **four independent `__ldg` loads** per loop iteration:
+
+```cuda
+float sum0 = 0.f, sum1 = 0.f, sum2 = 0.f, sum3 = 0.f;
+for (; idx4 + 3 * stride < end4; idx4 += 4 * stride) {
+    float4 v0 = __ldg(&inputs4[idx4]);
+    float4 v1 = __ldg(&inputs4[idx4 + stride]);
+    float4 v2 = __ldg(&inputs4[idx4 + 2 * stride]);
+    float4 v3 = __ldg(&inputs4[idx4 + 3 * stride]);
+    sum0 += v0.x + v0.y + v0.z + v0.w;
+    sum1 += v1.x + v1.y + v1.z + v1.w;
+    sum2 += v2.x + v2.y + v2.z + v2.w;
+    sum3 += v3.x + v3.y + v3.z + v3.w;
+}
+float sum = sum0 + sum1 + sum2 + sum3;
+```
+
+Because `sum0`–`sum3` are **independent registers**, the compiler can emit all four `__ldg` loads back-to-back before any add result is needed. The hardware's out-of-order issue logic sees four in-flight DRAM requests per iteration instead of one, keeping the memory controllers fully saturated.
+
+`__ldg` is also explicit here (rather than relying on `__restrict__`) — it routes through the read-only texture cache path, which is optimised for streaming access patterns and reduces L1 pressure on the reduction bookkeeping.
+
+### Dispatch logic
+
+The kernel is selected at runtime with zero overhead:
+
+```c
+#define N_ILP4_THRESHOLD 200000000UL   // ~800 MB; DRAM-bound above this
+
+if (n >= N_ILP4_THRESHOLD)
+    reduce_sum_kernel_float_in_ilp4<<<blocks, threads>>>(d_input, n, d_partial);
+else
+    reduce_sum_kernel_float_in<<<blocks, threads>>>(d_input, n, d_partial);
+```
+
+Below 200M the array still fits partially in L2/L1, loads resolve quickly, and the ILP4 loop's larger register footprint (4 accumulators instead of 1) would only add register pressure with no payoff. The original kernel is kept for all small-to-medium sizes.
+
+### Expected impact
+
+| n | Before (ms) | After (ms) | Δ |
+|---|---|---|---|
+| 200M | ~2.95 | ~2.80 | ~5% |
+| 500M | ~7.36 | ~7.00–7.10 | ~4–5% |
+| 1B | ~14.91 | ~14.2–14.5 | ~3–5% |
+
+The T4's theoretical DRAM bandwidth peak is ~320 GB/s. At 1B float32 elements (4 GB), the floor is ~12.5 ms. The ILP4 kernel is expected to bring efficiency from ~84% up to ~87–90%, closing most of the remaining gap to PyTorch/CUB.
+
+---
+
 ## License
 
 MIT License — see [LICENSE](LICENSE).
