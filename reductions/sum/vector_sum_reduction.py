@@ -64,15 +64,20 @@ def reduce_sum_kernel_final(
     tl.store(out_ptr, s)
 
 
-def get_reduction_config(n: int, block_size: int = 1024, max_partials: int = 1024):
-    """Choose num_programs and num_steps for occupancy (device-aware)."""
+def get_reduction_config(n: int, block_size: int = 1024, max_partials: int = 1024,
+                         num_warps: int = 4):
+    """Choose num_programs and num_steps for occupancy (device-aware).
+
+    num_warps must match the num_warps used at kernel launch (Triton default: 4).
+    threads_per_program = num_warps * warp_size (32), so the default is 128, not 256.
+    Using 256 would halve max_blocks_per_sm and under-schedule small-to-medium arrays.
+    """
     total_blocks = (n + block_size - 1) // block_size
     try:
         props = torch.cuda.get_device_properties(0)
         num_sms = props.multi_processor_count
         max_threads_per_sm = getattr(props, "max_threads_per_multiprocessor", 1024)
-        # Approximate blocks per SM (Triton uses block = program; assume ~256 threads per program)
-        threads_per_program = 256
+        threads_per_program = num_warps * 32  # warp size is always 32 on NVIDIA GPUs
         max_blocks_per_sm = max(1, max_threads_per_sm // threads_per_program)
         target_programs = num_sms * max_blocks_per_sm
     except Exception:
@@ -83,12 +88,16 @@ def get_reduction_config(n: int, block_size: int = 1024, max_partials: int = 102
     return num_programs, num_steps, total_blocks
 
 
+_NUM_WARPS = 4  # Triton default; must stay in sync with get_reduction_config call below
+
+
 def reduce_sum_triton(x: torch.Tensor, block_size: int = 1024, max_partials: int = 1024):
     """Two-pass sum reduction; returns scalar tensor on same device as x."""
     n = x.numel()
     if n == 0:
         return x.sum()
-    num_programs, num_steps, _ = get_reduction_config(n, block_size, max_partials)
+    num_programs, num_steps, _ = get_reduction_config(n, block_size, max_partials,
+                                                       num_warps=_NUM_WARPS)
     partial = torch.empty((num_programs,), device=x.device, dtype=torch.float32)
     out = torch.empty((1,), device=x.device, dtype=torch.float32)
     BLOCK_SIZE_2 = triton.next_power_of_2(num_programs)
@@ -99,12 +108,14 @@ def reduce_sum_triton(x: torch.Tensor, block_size: int = 1024, max_partials: int
         BLOCK_SIZE=block_size,
         num_programs=num_programs,
         num_steps=num_steps,
+        num_warps=_NUM_WARPS,
     )
     reduce_sum_kernel_final[(1,)](
         partial,
         out,
         n_partials=num_programs,
         BLOCK_SIZE_2=BLOCK_SIZE_2,
+        num_warps=_NUM_WARPS,
     )
     return out[0]
 
@@ -178,7 +189,8 @@ def main():
 
     block_size = 1024
     max_partials = 1024
-    num_programs, num_steps, _ = get_reduction_config(n, block_size, max_partials)
+    num_programs, num_steps, _ = get_reduction_config(n, block_size, max_partials,
+                                                       num_warps=_NUM_WARPS)
 
     # Partial and output buffers
     partial = torch.empty((num_programs,), device=x.device, dtype=torch.float32)
@@ -191,9 +203,11 @@ def main():
             reduce_sum_kernel_forward[(num_programs,)](
                 x, partial, n_elements=n, BLOCK_SIZE=block_size,
                 num_programs=num_programs, num_steps=num_steps,
+                num_warps=_NUM_WARPS,
             )
             reduce_sum_kernel_final[(1,)](
                 partial, out, n_partials=num_programs, BLOCK_SIZE_2=BLOCK_SIZE_2,
+                num_warps=_NUM_WARPS,
             )
         torch.cuda.synchronize()
 
@@ -205,9 +219,11 @@ def main():
         reduce_sum_kernel_forward[(num_programs,)](
             x, partial, n_elements=n, BLOCK_SIZE=block_size,
             num_programs=num_programs, num_steps=num_steps,
+            num_warps=_NUM_WARPS,
         )
         reduce_sum_kernel_final[(1,)](
             partial, out, n_partials=num_programs, BLOCK_SIZE_2=BLOCK_SIZE_2,
+            num_warps=_NUM_WARPS,
         )
         end_ev.record()
         torch.cuda.synchronize()
