@@ -1,7 +1,8 @@
 /*
  * Fast 1D vector sum reduction (CUDA).
  *
- * Pattern: strided per-thread accumulation → warp shuffle reduction
+ * For n > 100 million uses CUB DeviceReduce::Sum; otherwise custom two-pass
+ * reduction: strided per-thread accumulation → warp shuffle reduction
  * → shared memory for block partial sums → second pass to single scalar.
  * Based on:
  *   - Ash Vardanian, ParallelReductionsBenchmark (reduce_cuda.cuh)
@@ -21,9 +22,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cuda_runtime.h>
+#include <cub/cub.cuh>
 
 #define WARP_SIZE 32
 #define FULL_MASK 0xffffffffu
+
+// Use CUB DeviceReduce::Sum when n exceeds this (100 million).
+#define N_CUB_THRESHOLD 100000000UL
 
 // At this element count (~800 MB) the kernel becomes fully DRAM-bandwidth-bound.
 // Above the threshold, the single-accumulator dependency chain limits ILP and
@@ -187,10 +192,19 @@ __global__ void reduce_sum_kernel_float_in_pass2(const float* __restrict__ input
 
 // -----------------------------------------------------------------------------
 // Host: run two-pass reduction in float, return result.
-// Second pass uses one block with one thread per partial (coalesced) to cut DRAM.
+// When n >= N_CUB_THRESHOLD use CUB; else second pass uses one block with one
+// thread per partial (coalesced) to cut DRAM.
 // -----------------------------------------------------------------------------
 static float reduce_sum(const float* d_inputs, size_t n, int blocks, int threads_per_block,
-                        float* d_partial) {
+                        float* d_partial, void* d_cub_temp, size_t cub_temp_bytes) {
+  if (n >= N_CUB_THRESHOLD && d_cub_temp != nullptr) {
+    (void)cub::DeviceReduce::Sum(d_cub_temp, cub_temp_bytes, d_inputs, d_partial, n);
+    cudaDeviceSynchronize();
+    float result;
+    cudaMemcpy(&result, d_partial, sizeof(float), cudaMemcpyDeviceToHost);
+    return result;
+  }
+
   if (n >= N_ILP4_THRESHOLD)
     reduce_sum_kernel_float_in_ilp4<<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
   else
@@ -198,7 +212,6 @@ static float reduce_sum(const float* d_inputs, size_t n, int blocks, int threads
 
   // One thread per partial, round up to warp size; cap at 1024
   int pass2_threads = (int)((blocks + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);
-  if (pass2_threads > 1024) pass2_threads = 1024;
   if (pass2_threads < WARP_SIZE) pass2_threads = WARP_SIZE;
 
   reduce_sum_kernel_float_in_pass2<<<1, pass2_threads>>>(d_partial, (size_t)blocks, d_partial);
@@ -287,12 +300,20 @@ int main(int argc, char** argv) {
   cudaMalloc(&d_input, n * sizeof(float));
   cudaMalloc(&d_partial, (size_t)max_blocks * sizeof(float));
 
+  void* d_cub_temp = nullptr;
+  size_t cub_temp_bytes = 0;
+  if (n >= N_CUB_THRESHOLD) {
+    cudaError_t err = cub::DeviceReduce::Sum(nullptr, cub_temp_bytes, d_input, d_partial, n);
+    if (err != cudaSuccess) { fprintf(stderr, "CUB temp size query failed: %s\n", cudaGetErrorString(err)); cudaFree(d_partial); cudaFree(d_input); free(h_input); return 1; }
+    cudaMalloc(&d_cub_temp, cub_temp_bytes);
+  }
+
   cudaMemcpy(d_input, h_input, n * sizeof(float), cudaMemcpyHostToDevice);
 
   if (do_warmup) {
     const int warmup_iters = 3;
     for (int w = 0; w < warmup_iters; w++)
-      (void)reduce_sum(d_input, n, blocks, threads, d_partial);
+      (void)reduce_sum(d_input, n, blocks, threads, d_partial, d_cub_temp, cub_temp_bytes);
   }
 
   int pass2_threads = (int)((blocks + WARP_SIZE - 1) / WARP_SIZE * WARP_SIZE);
@@ -305,11 +326,15 @@ int main(int argc, char** argv) {
   float total_ms = 0.f;
   for (int t = 0; t < timed_iters; t++) {
     cudaEventRecord(ev_start);
-    if (n >= N_ILP4_THRESHOLD)
-      reduce_sum_kernel_float_in_ilp4<<<blocks, threads>>>(d_input, n, d_partial);
-    else
-      reduce_sum_kernel_float_in<<<blocks, threads>>>(d_input, n, d_partial);
-    reduce_sum_kernel_float_in_pass2<<<1, pass2_threads>>>(d_partial, (size_t)blocks, d_partial);
+    if (n >= N_CUB_THRESHOLD)
+      (void)cub::DeviceReduce::Sum(d_cub_temp, cub_temp_bytes, d_input, d_partial, n);
+    else {
+      if (n >= N_ILP4_THRESHOLD)
+        reduce_sum_kernel_float_in_ilp4<<<blocks, threads>>>(d_input, n, d_partial);
+      else
+        reduce_sum_kernel_float_in<<<blocks, threads>>>(d_input, n, d_partial);
+      reduce_sum_kernel_float_in_pass2<<<1, pass2_threads>>>(d_partial, (size_t)blocks, d_partial);
+    }
     cudaEventRecord(ev_stop);
     cudaEventSynchronize(ev_stop);
     float ms = 0.f;
@@ -326,6 +351,7 @@ int main(int argc, char** argv) {
   int num_sms = 0;
   cudaDeviceGetAttribute(&num_sms, cudaDevAttrMultiProcessorCount, 0);
   printf("n = %zu\n", n);
+  printf("reduction = %s\n", n >= N_CUB_THRESHOLD ? "CUB" : "custom");
   printf("blocks = %d\n", blocks);
   printf("threads = %d\n", threads);
   printf("SMs = %d\n", num_sms);
@@ -348,6 +374,7 @@ int main(int argc, char** argv) {
   else
     printf("VERIFY FAIL: gpu=%.10g ref=%.10g\n", (double)sum, (double)ref);
 
+  if (d_cub_temp) cudaFree(d_cub_temp);
   cudaFree(d_partial);
   cudaFree(d_input);
   free(h_input);
