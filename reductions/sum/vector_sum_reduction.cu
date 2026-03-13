@@ -197,7 +197,7 @@ __global__ void reduce_sum_kernel_float_in_pass2(const float* __restrict__ input
 // -----------------------------------------------------------------------------
 static float reduce_sum(const float* d_inputs, size_t n, int blocks, int threads_per_block,
                         float* d_partial, void* d_cub_temp, size_t cub_temp_bytes) {
-  if (n >= N_CUB_THRESHOLD && d_cub_temp != nullptr) {
+  if (n > N_CUB_THRESHOLD && d_cub_temp != nullptr) {
     (void)cub::DeviceReduce::Sum(d_cub_temp, cub_temp_bytes, d_inputs, d_partial, n);
     cudaDeviceSynchronize();
     float result;
@@ -205,7 +205,7 @@ static float reduce_sum(const float* d_inputs, size_t n, int blocks, int threads
     return result;
   }
 
-  if (n >= N_ILP4_THRESHOLD)
+  if (n > N_ILP4_THRESHOLD)
     reduce_sum_kernel_float_in_ilp4<<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
   else
     reduce_sum_kernel_float_in<<<blocks, threads_per_block>>>(d_inputs, n, d_partial);
