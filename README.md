@@ -76,9 +76,31 @@ All implementations pass correctness verification at every size. Timings are ave
 1,000,000,000  PyTorch   14.4983
 ```
 
+### CUDA C vs CUDA CUB (direct comparison)
+
+On the NVIDIA T4, `CUDA C` beats `CUDA CUB` for `n = 10K .. 750M` and is essentially tied for large sizes; the only exception in this sweep is `n = 1B`, where `CUDA CUB` is ~0.02% faster.
+
+Speedup (CUB time / C time):
+
+| `n` range | CUDA C speedup vs CUB | interpretation |
+|---|---:|---|
+| `10K .. 1M` | `1.238x .. 1.333x` | CUDA C is ~24% to 33% faster (largest gap) |
+| `10M .. 100M` | `1.001x .. 1.012x` | gap shrinks to <= ~1.2% |
+| `>= 250M` | `~1.0006x .. 1.0019x` | almost identical; DRAM bandwidth dominates |
+
+##### Reference plots
+
+![Performance scaling (avg_kernel_ms vs n)](reductions/sum/img/avg_time.png)
+
+![Speedup vs PyTorch baseline](reductions/sum/img/pytorch_baseline.png)
+
+![DRAM throughput utilization snapshot (NCU)](reductions/sum/img/DRAM_throughput.png)
+
+![DRAM traffic (read + write) snapshot (NCU)](reductions/sum/img/DRAM_read_write.png)
+
 ### Why hand-tuned CUDA C wins at small-to-medium sizes
 
-The hand-written kernel (`vector_sum_reduction.cu`) outperforms all others from 10K to 100M elements — by a wide margin at small sizes:
+The hand-written kernel (`vector_sum_reduction.cu`) outperforms all others from 10K to 100M elements — by a wide margin at small sizes. Relative to `CUDA CUB` specifically, `CUDA C` is ~1.24–1.33x faster at `10K .. 1M`, but the advantage collapses to <= ~1.2% once `n` reaches `10M` (both implementations become strongly DRAM-bandwidth limited).
 
 | n | CUDA C (ms) | CUB (ms) | Triton (ms) | PyTorch (ms) | CUDA C vs PyTorch | CUDA C vs Triton |
 |---|---|---|---|---|---|---|
@@ -95,6 +117,25 @@ The hand-written kernel (`vector_sum_reduction.cu`) outperforms all others from 
 - **Minimal shared memory** — only one `float` per warp is staged in shared memory for the cross-warp reduction (32 floats total), keeping the footprint tiny.
 - **SM-aware launch config** — block count is computed from `multiProcessorCount × max_blocks_per_SM` to saturate all SMs without over-subscribing the second-pass reduction.
 - **Contiguous block assignment** — each block is assigned a contiguous chunk of the input rather than a global stride pattern, improving L1/L2 cache locality.
+
+For these sizes, instruction-level efficiency and warp-level reduction overhead dominate; the runtime gap to `CUDA CUB` shrinks as the workload becomes DRAM bandwidth-limited (see `DRAM_throughput.png` and `DRAM_read_write.png`).
+
+From a hardware perspective, the trends line up with the memory hierarchy and the role of achieved occupancy:
+
+At `n = 10K .. 1M`, the working set per block is small enough that `L1`/`texture` and `L2` (`l1tex__throughput...` and `lts__t_sectors...` in the notebook) contribute more than raw DRAM latency. CUDA C’s `float4`-streaming and contiguous block assignment keep global loads highly regular, which improves effective cache utilization and reduces warp stalls during the reduction (reflected by better warp efficiency and lower overhead).
+
+As `n` grows to `>= 10M`, the input no longer fits well in `L2`, so most memory traffic turns into true DRAM streaming; in that regime the achieved occupancy can help hide latency, but it cannot overcome the DRAM bandwidth ceiling. That is why `CUDA C` and `CUDA CUB` converge and the remaining differences become small (and largely explained by slight differences in DRAM throughput/traffic utilization).
+
+| Reduction pass | Implementation | DRAM throughput (% of peak sustained) | L1/texture throughput (% of peak sustained) | L2/shared throughput (% of peak sustained) | Achieved occupancy (% of peak sustained active warps) | DRAM read+write traffic (GB) |
+|---|---|---:|---:|---:|---:|---:|
+| Reduction pass 1 | CUDA C | 97.40 | 36.00 | 30.74 | 99.90 | 5.986e-09 |
+| Reduction pass 1 | CUDA CUB | 97.61 | 36.01 | 30.75 | 99.91 | 5.994e-09 |
+| Reduction pass 2 | CUDA C | 1.20 | 0.29 | 1.82 | 23.73 | 1.840e-13 |
+| Reduction pass 2 | CUDA CUB | 1.23 | 0.24 | 1.81 | 24.21 | 2.500e-14 |
+
+Notes:
+- The DRAM and cache-related counters in this table are the same NCU metrics visualized in `DRAM_throughput.png`, `DRAM_read_write.png`, and the L1/L2 plots from the notebook.
+- Pass 1 runs with high achieved occupancy and high cache throughput; pass 2 is dramatically lower (both occupancy and throughput), so small scheduling differences have less room to change the final performance once DRAM streaming dominates.
 
 ### Why PyTorch wins at very large sizes (≥500M)
 
